@@ -1,0 +1,22 @@
+version: '3.8'
+# Location for Backup script /opt/docker/stacks/backup-script/backup.sh
+services:
+  backup-job:
+    image: debian:stable-slim
+    entrypoint: ["/backup-script/backup.sh"]
+    environment:
+      - TZ=America/New_York
+    volumes:
+      - /opt/docker/stacks/backup-script/backup.sh:/backup-script/backup.sh:ro
+      - /var/lib/docker/volumes/portainer_data/_data:/portainer:ro
+      - /var/lib/docker/volumes/jira_postgres_data/_data:/jira_postgres:ro
+      - /var/lib/docker/volumes/grafana_data/_data:/grafana:ro
+      - backup_nas:/backup
+    
+volumes:
+  backup_nas:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=192.168.200.3,nfsvers=4,rw
+      device: :/volume1/docker_backups/OptiPlex_Docker
