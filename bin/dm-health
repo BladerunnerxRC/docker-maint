@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# dm-health — container health report with a non-zero exit on problems
+# (suitable for cron / monitoring hooks).
+set -euo pipefail
+# shellcheck source=../lib/common.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
+
+usage() {
+  cat <<EOF
+${BOLD}dm-health${RESET} — container health report
+
+${BOLD}Usage:${RESET} dm-health [options]
+
+${BOLD}Options:${RESET}
+  -p, --project NAME     Only check containers in this compose project
+  -r, --max-restarts N   Flag containers restarted more than N times (default: 3)
+  -q, --quiet            Print only problems (no table); exit code still set
+  -j, --json             Emit JSON results instead of a table
+  -h, --help             Show this help
+
+${BOLD}Checks:${RESET} state, healthcheck status, restart count, OOM kills,
+non-zero exit codes, missing healthcheck, restart policy.
+
+${BOLD}Exit codes:${RESET} 0 = all OK, 1 = warnings only, 2 = failures
+EOF
+}
+
+PROJECT="" MAX_RESTARTS=3 QUIET=0 JSON=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -p|--project)      PROJECT="$2"; shift ;;
+    -r|--max-restarts) MAX_RESTARTS="$2"; shift ;;
+    -q|--quiet)        QUIET=1 ;;
+    -j|--json)         JSON=1 ;;
+    -h|--help)         usage; exit 0 ;;
+    *) die "Unknown option: $1 (see --help)" ;;
+  esac
+  shift
+done
+
+need_docker; need jq
+
+filter=(); [[ -n "$PROJECT" ]] && filter=(--filter "label=com.docker.compose.project=$PROJECT")
+ids=$(docker ps -aq "${filter[@]}")
+[[ -z "$ids" ]] && { warn "No containers found${PROJECT:+ in project '$PROJECT'}"; exit 0; }
+
+# Evaluate each container in jq → one TSV row: name, verdict, state, health, restarts, exit, notes
+# shellcheck disable=SC2086
+results=$(docker inspect $ids | jq -r --argjson maxr "$MAX_RESTARTS" '
+  .[] |
+  (.Name | ltrimstr("/")) as $name |
+  .State as $s |
+  (.HostConfig.RestartPolicy.Name // "no") as $policy |
+  ([
+    (if $s.Status == "restarting"            then {lvl: 2, msg: "restart loop"} else empty end),
+    (if $s.Health.Status == "unhealthy"      then {lvl: 2, msg: "healthcheck failing: \((($s.Health.Log // []) | last // {}) | (.Output // "" | gsub("\\s+"; " ") | if length > 70 then .[0:69] + "…" else . end) as $o | if $o == "" then "exit \(.ExitCode)" else $o end)"} else empty end),
+    (if $s.OOMKilled                         then {lvl: 2, msg: "OOM killed"} else empty end),
+    (if $s.Status == "exited" and $s.ExitCode != 0 then {lvl: 2, msg: "exited with code \($s.ExitCode)"} else empty end),
+    (if $s.Status == "dead"                  then {lvl: 2, msg: "dead"} else empty end),
+    (if .RestartCount > $maxr                then {lvl: 1, msg: "\(.RestartCount) restarts"} else empty end),
+    (if $s.Health.Status == "starting"       then {lvl: 1, msg: "health starting"} else empty end),
+    (if $s.Status == "running" and ($s.Health == null) then {lvl: 0, msg: "no healthcheck"} else empty end),
+    (if $s.Status == "running" and $policy == "no" then {lvl: 0, msg: "no restart policy"} else empty end)
+  ]) as $issues |
+  ([$issues[].lvl] | max // 0) as $lvl |
+  [ $name,
+    (if $lvl == 2 then "FAIL" elif $lvl == 1 then "WARN" else "OK" end),
+    $s.Status, ($s.Health.Status // "-"), (.RestartCount | tostring),
+    (if $s.Status == "exited" then ($s.ExitCode | tostring) else "-" end),
+    $policy,
+    ([$issues[].msg] | join("; ") | if . == "" then "-" else . end)
+  ] | @tsv' |
+  awk -F'\t' '{ print ($2 == "FAIL" ? 0 : $2 == "WARN" ? 1 : 2) "\t" $0 }' | sort -t$'\t' -k1,1n -k2,2 | cut -f2-)
+
+fails=$(awk -F'\t' '$2=="FAIL"' <<<"$results" | wc -l)
+warns=$(awk -F'\t' '$2=="WARN"' <<<"$results" | wc -l)
+oks=$(awk -F'\t' '$2=="OK"' <<<"$results" | wc -l)
+rc=0; (( warns > 0 )) && rc=1; (( fails > 0 )) && rc=2
+
+if (( JSON )); then
+  jq -Rn '[inputs | split("\t") | {name: .[0], verdict: .[1], state: .[2], health: .[3],
+          restarts: (.[4]|tonumber), exit_code: .[5], restart_policy: .[6], notes: .[7]}]' <<<"$results"
+  exit "$rc"
+fi
+
+if (( QUIET )); then
+  while IFS=$'\t' read -r name verdict _ _ _ _ _ notes; do
+    case "$verdict" in
+      FAIL) err  "${BOLD}${name}${RESET}: ${notes}" ;;
+      WARN) warn "${BOLD}${name}${RESET}: ${notes}" ;;
+    esac
+  done <<<"$results"
+  exit "$rc"
+fi
+
+banner "Container Health Report" "$(hostname) · $(date '+%Y-%m-%d %H:%M:%S')${PROJECT:+ · project: $PROJECT}"
+section "Results"
+{
+  printf 'CONTAINER\tVERDICT\tSTATE\tHEALTH\tRESTARTS\tEXIT\tPOLICY\tNOTES\n'
+  while IFS=$'\t' read -r name verdict state health restarts exitc policy notes; do
+    icon="${GREEN}✔${RESET}"; [[ $verdict == WARN ]] && icon="${YELLOW}⚠${RESET}"; [[ $verdict == FAIL ]] && icon="${RED}✖${RESET}"
+    ncol="$GREY"; [[ $verdict == WARN ]] && ncol="$YELLOW"; [[ $verdict == FAIL ]] && ncol="$RED"
+    pcol="$policy"; [[ $policy == no ]] && pcol="${GREY}no${RESET}"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${BOLD}${name}${RESET}" "$icon $(color_state "$verdict")" \
+      "$(color_state "$state")" "$(color_state "$health")" "$restarts" "$exitc" "$pcol" "${ncol}$(trunc "$notes" 70)${RESET}"
+  done <<<"$results"
+} | table
+
+section "Summary"
+printf '  %s✔ %d ok%s   %s⚠ %d warning%s   %s✖ %d failing%s\n\n' \
+  "$GREEN" "$oks" "$RESET" "$YELLOW" "$warns" "$RESET" "$RED$BOLD" "$fails" "$RESET"
+exit "$rc"

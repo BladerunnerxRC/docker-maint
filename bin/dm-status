@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# dm-status — one-screen overview of a Docker host.
+set -euo pipefail
+# shellcheck source=../lib/common.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
+
+usage() {
+  cat <<EOF
+${BOLD}dm-status${RESET} — Docker host overview dashboard
+
+${BOLD}Usage:${RESET} dm-status [options]
+
+${BOLD}Options:${RESET}
+  -a, --all        Include stopped containers in the container table
+  -s, --short      Only summary counts (no tables)
+  -h, --help       Show this help
+EOF
+}
+
+SHOW_ALL=0 SHORT=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -a|--all)   SHOW_ALL=1 ;;
+    -s|--short) SHORT=1 ;;
+    -h|--help)  usage; exit 0 ;;
+    *) die "Unknown option: $1 (see --help)" ;;
+  esac
+  shift
+done
+
+need_docker
+
+banner "Docker Host Status — $(hostname)" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+
+# ── Engine ────────────────────────────────────────────────────────────────
+section "Engine"
+IFS=$'\t' read -r sv os kern cpus mem driver root swarm < <(
+  docker info --format '{{.ServerVersion}}	{{.OperatingSystem}}	{{.KernelVersion}}	{{.NCPU}}	{{.MemTotal}}	{{.Driver}}	{{.DockerRootDir}}	{{.Swarm.LocalNodeState}}'
+)
+kv "Server version" "${BOLD}${sv}${RESET}"
+kv "Compose" "$(docker compose version --short 2>/dev/null || echo "${GREY}not installed${RESET}")"
+kv "OS / Kernel" "${os} / ${kern}"
+kv "CPUs / Memory" "${cpus} / $(human_bytes "$mem")"
+kv "Storage driver" "${driver}"
+kv "Root dir" "${root}"
+kv "Swarm" "$(color_state "${swarm:-inactive}")"
+
+# Root dir disk usage
+if df_line=$(df -P "$root" 2>/dev/null | awk 'NR==2'); then
+  read -r _ size used _ pct _ <<<"$df_line"
+  pct=${pct%\%}
+  kv "Disk (${root})" "$(bar "$pct" 24) $(color_pct "$pct" 75 90)  ${GREY}$(human_bytes $((used*1024))) used / $(human_bytes $((size*1024)))${RESET}"
+fi
+
+# ── Summary counts ────────────────────────────────────────────────────────
+section "Summary"
+running=$(docker ps -q | wc -l)
+total=$(docker ps -aq | wc -l)
+exited=$(docker ps -aq --filter status=exited | wc -l)
+restarting=$(docker ps -q --filter status=restarting | wc -l)
+unhealthy=$(docker ps -q --filter health=unhealthy | wc -l)
+images=$(docker images -q | sort -u | wc -l)
+dangling=$(docker images -q -f dangling=true | wc -l)
+volumes=$(docker volume ls -q | wc -l)
+dvols=$(docker volume ls -q -f dangling=true | wc -l)
+networks=$(docker network ls -q | wc -l)
+projects=$(docker ps -a --format '{{.Label "com.docker.compose.project"}}' | sed '/^$/d' | sort -u | wc -l)
+
+num() { local n=$1 c=$2; (( n > 0 )) && printf '%s%s%s' "$c" "$n" "$RESET" || printf '%s0%s' "$GREY" "$RESET"; }
+kv "Containers" "${BOLD}${total}${RESET} total · $(num "$running" "$GREEN") running · $(num "$exited" "$YELLOW") exited · $(num "$restarting" "$RED") restarting · $(num "$unhealthy" "$RED") unhealthy"
+kv "Images" "${BOLD}${images}${RESET} total · $(num "$dangling" "$YELLOW") dangling"
+kv "Volumes" "${BOLD}${volumes}${RESET} total · $(num "$dvols" "$YELLOW") unused"
+kv "Networks" "${BOLD}${networks}${RESET}"
+kv "Compose projects" "${BOLD}${projects}${RESET}"
+
+(( SHORT )) && exit 0
+
+# ── Containers ────────────────────────────────────────────────────────────
+section "Containers"
+ps_args=(); (( SHOW_ALL )) && ps_args=(-a)
+ids=$(docker ps "${ps_args[@]}" -q)
+if [[ -z "$ids" ]]; then
+  muted "  (no containers)"
+else
+  {
+    printf 'NAME\tPROJECT\tIMAGE\tSTATE\tHEALTH\tRESTARTS\tUPTIME\tPORTS\n'
+    # shellcheck disable=SC2086
+    docker inspect $ids | jq -r '.[] | [
+        (.Name | ltrimstr("/")),
+        (.Config.Labels["com.docker.compose.project"] // "-"),
+        .Config.Image,
+        .State.Status,
+        (.State.Health.Status // "-"),
+        (.RestartCount | tostring),
+        .State.StartedAt,
+        ([.NetworkSettings.Ports // {} | to_entries[] | select(.value != null) | .key as $k | .value[] | select(.HostIp != "::") | "\(.HostPort)→\($k)"] | unique | join(",") | if . == "" then "-" else . end)
+      ] | @tsv' | sort -t$'\t' -k2,2 -k1,1 |
+    while IFS=$'\t' read -r name proj image state health rc started ports; do
+      rc_c="$rc"; (( rc > 0 )) && rc_c="${YELLOW}${rc}${RESET}"
+      up="-"; [[ "$state" == running ]] && up=$(ago "$started" | sed 's/ ago//')
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${BOLD}${name}${RESET}" "${CYAN}${proj}${RESET}" \
+        "$(trunc "$image" 40)" "$(color_state "$state")" "$(color_state "$health")" "$rc_c" "$up" "$(trunc "$ports" 40)"
+    done
+  } | table
+fi
+
+# ── Disk usage ────────────────────────────────────────────────────────────
+section "Disk Usage"
+{
+  printf 'TYPE\tTOTAL\tACTIVE\tSIZE\tRECLAIMABLE\n'
+  docker system df --format '{{.Type}}	{{.TotalCount}}	{{.Active}}	{{.Size}}	{{.Reclaimable}}' |
+    awk -F'\t' -v Y="$YELLOW" -v R="$RESET" '{ $5 = ($5 ~ /^0B/ ? $5 : Y $5 R); print }' OFS='\t'
+} | table
+
+# ── Alerts ────────────────────────────────────────────────────────────────
+section "Alerts"
+alerts=0
+while IFS= read -r n; do [[ -n "$n" ]] && { err "Unhealthy: ${BOLD}$n${RESET}"; alerts=$((alerts+1)); }; done \
+  < <(docker ps --filter health=unhealthy --format '{{.Names}}')
+while IFS= read -r n; do [[ -n "$n" ]] && { err "Restarting: ${BOLD}$n${RESET}"; alerts=$((alerts+1)); }; done \
+  < <(docker ps --filter status=restarting --format '{{.Names}}')
+while IFS=$'\t' read -r n s; do
+  [[ -n "$n" ]] && [[ "$s" != *"(0)"* ]] && { warn "Exited non-zero: ${BOLD}$n${RESET} ${GREY}($s)${RESET}"; alerts=$((alerts+1)); }
+done < <(docker ps -a --filter status=exited --format '{{.Names}}	{{.Status}}')
+if [[ -n "${pct:-}" ]] && (( pct >= 85 )); then warn "Docker root disk at ${pct}%"; alerts=$((alerts+1)); fi
+(( alerts == 0 )) && ok "No issues detected"
+echo

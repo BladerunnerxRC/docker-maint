@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# dm-compose-lint — validate compose files and audit them against best practices.
+set -euo pipefail
+# shellcheck source=../lib/common.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
+
+usage() {
+  cat <<EOF
+${BOLD}dm-compose-lint${RESET} — validate & audit compose files
+
+${BOLD}Usage:${RESET} dm-compose-lint [options] [FILE|DIR ...]
+
+Directories are searched recursively for *.yml / *.yaml files with a top-level 'services:' key.
+Default: current directory.
+
+${BOLD}Options:${RESET}
+  -s, --strict       Treat warnings as errors (exit 2)
+  -q, --quiet        Hide INFO findings
+  -h, --help         Show this help
+
+${BOLD}Severity:${RESET} ${RED}ERROR${RESET} invalid or dangerous · ${YELLOW}WARN${RESET} likely problem · ${BLUE}INFO${RESET} suggestion
+${BOLD}Exit codes:${RESET} 0 clean/info only · 1 warnings · 2 errors
+EOF
+}
+
+STRICT=0 QUIET=0 TARGETS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -s|--strict) STRICT=1 ;;
+    -q|--quiet)  QUIET=1 ;;
+    -h|--help)   usage; exit 0 ;;
+    -*) die "Unknown option: $1 (see --help)" ;;
+    *)  TARGETS+=("$1") ;;
+  esac
+  shift
+done
+(( ${#TARGETS[@]} )) || TARGETS=(.)
+
+need docker jq
+CC=$(compose_cmd) || die "docker compose (v2) or docker-compose is required"
+
+FILES=()
+for t in "${TARGETS[@]}"; do
+  if [[ -d "$t" ]]; then
+    while IFS= read -r f; do FILES+=("$f"); done < <(
+      find "$t" -type f \( -iname '*.yml' -o -iname '*.yaml' \) \
+        -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/.github/*' -print0 |
+        xargs -0 -r grep -l -E '^services:' | sort)
+  elif [[ -f "$t" ]]; then FILES+=("$t")
+  else warn "Not found: $t"; fi
+done
+(( ${#FILES[@]} )) || die "No compose files found"
+
+# Audit rules, applied to `compose config --no-interpolate --format json` output.
+# Emits TSV: severity, service, message
+RULES='
+def sev($s; $svc; $m): [$s, $svc, $m] | @tsv;
+def dbports: ["3306","5432","6379","27017","9200","11211","5984","8086"];
+(.services // {}) | to_entries[] | .key as $svc | .value as $s |
+  ($s.image // "") as $img |
+  (if $img == "" and ($s.build == null) then sev("ERROR"; $svc; "no image or build defined") else empty end),
+  (if $img != "" and ($img | test("\\$\\{") | not) and ($img | test("@sha256:") | not) then
+     ($img | split("/") | last) as $last |
+     if ($last | contains(":") | not) then sev("WARN"; $svc; "image \"\($img)\" has no tag (implies :latest) — pin a version")
+     elif ($last | endswith(":latest")) then sev("WARN"; $svc; "image \"\($img)\" uses :latest — pin a version")
+     else empty end
+   else empty end),
+  (if ($s.restart // "") == "" and ($s.deploy.restart_policy == null) then sev("WARN"; $svc; "no restart policy (use unless-stopped / always)") else empty end),
+  (if $s.healthcheck == null then sev("INFO"; $svc; "no healthcheck defined") else empty end),
+  (if $s.privileged == true then sev("WARN"; $svc; "runs privileged — grant specific cap_add instead") else empty end),
+  (($s.cap_add // [])[] | select(IN("ALL", "SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE")) | sev("WARN"; $svc; "cap_add \(.) is very broad")),
+  (if ($s.network_mode // "") == "host" then sev("INFO"; $svc; "network_mode: host bypasses network isolation") else empty end),
+  (($s.volumes // [])[] | select(.type == "bind" and ((.source // "") | test("docker\\.sock$"))) |
+     sev("WARN"; $svc; "mounts the Docker socket\(if .read_only then " (read-only still grants root-equivalent API access)" else " read-write — root-equivalent access to the host" end)")),
+  (($s.volumes // [])[] | select(.type == "bind" and (.source // "") == "/") | sev("ERROR"; $svc; "bind-mounts the host root filesystem")),
+  (($s.ports // [])[] | select((.host_ip // "") | IN("", "0.0.0.0", "::")) |
+     select((.target | tostring) as $t | dbports | index($t)) |
+     sev("WARN"; $svc; "database port \(.target) published on all interfaces — bind to 127.0.0.1 or drop it")),
+  (($s.environment // {}) | if type == "array" then map(capture("^(?<key>[^=]*)=?(?<value>.*)$")) else to_entries end | .[] |
+     select((.key | test("PASS|SECRET|TOKEN|API_?KEY|PRIVATE"; "i")) and ((.value // "") | tostring | length > 0) and ((.value // "") | tostring | test("(^|[^$])\\$(\\{|[A-Za-z_])") | not)) |
+     sev("WARN"; $svc; "\(.key) is hard-coded — move it to .env or secrets")),
+  (if ($s.logging == null) then sev("INFO"; $svc; "no log rotation (logging.options max-size/max-file)") else empty end),
+  (if ($s.mem_limit == null and $s.deploy.resources.limits.memory == null) then sev("INFO"; $svc; "no memory limit") else empty end),
+  (($s.depends_on // {}) | to_entries[] | select(.value.condition == "service_started") |
+     sev("INFO"; $svc; "depends_on \(.key) without condition: service_healthy"))
+'
+
+TOTAL_E=0 TOTAL_W=0 TOTAL_I=0
+banner "Compose Lint" "${#FILES[@]} file(s)$( (( STRICT )) && echo ' · strict')"
+
+for f in "${FILES[@]}"; do
+  section "$f"
+  dir=$(dirname "$f")
+  # Validate syntax & schema (with interpolation, as compose would run it).
+  if ! msg=$($CC --project-directory "$dir" -f "$f" config -q 2>&1); then
+    printf '  %s✖ ERROR%s  %s\n' "$RED$BOLD" "$RESET" "compose config failed:"
+    sed "s/^/           ${GREY}/;s/$/${RESET}/" <<<"$msg"
+    TOTAL_E=$((TOTAL_E+1)); continue
+  fi
+  msg=$(grep -v 'attribute `version` is obsolete' <<<"$msg" || true)   # reported below as INFO
+  [[ -n "$msg" ]] && sed "s/^/  ${YELLOW}⚠ WARN ${RESET}  /" <<<"$msg"
+  json=$($CC --project-directory "$dir" -f "$f" config --no-interpolate --format json 2>/dev/null)
+
+  findings=$(jq -r "$RULES" <<<"$json")
+  # Raw-file checks (things normalization hides).
+  grep -qE '^version:' "$f" && findings+=$'\n'"INFO"$'\t'"-"$'\t'"top-level 'version:' is obsolete in Compose v2 — remove it"
+  findings=$(sed '/^$/d' <<<"$findings")
+
+  e=$(grep -c '^ERROR' <<<"$findings" || true); w=$(grep -c '^WARN' <<<"$findings" || true); i=$(grep -c '^INFO' <<<"$findings" || true)
+  TOTAL_E=$((TOTAL_E+e)); TOTAL_W=$((TOTAL_W+w)); TOTAL_I=$((TOTAL_I+i))
+  svcs=$(jq -r '.services | keys | join(", ")' <<<"$json")
+  printf '  %s✔ valid%s  %sservices:%s %s\n' "$GREEN" "$RESET" "$GREY" "$RESET" "$svcs"
+
+  if [[ -z "$findings" ]]; then ok "No findings"; continue; fi
+  {
+    printf 'SEVERITY\tSERVICE\tFINDING\n'
+    while IFS=$'\t' read -r sv svc m; do
+      case "$sv" in
+        ERROR) c="$RED$BOLD✖ ERROR" ;;
+        WARN)  c="$YELLOW⚠ WARN" ;;
+        INFO)  (( QUIET )) && continue; c="$BLUE• INFO" ;;
+      esac
+      printf '%s%s\t%s%s%s\t%s\n' "$c" "$RESET" "$CYAN" "$svc" "$RESET" "$m"
+    done < <(awk -F'\t' '{ r = ($1=="ERROR" ? 0 : $1=="WARN" ? 1 : 2); print r "\t" $0 }' <<<"$findings" | sort -t$'\t' -k1,1n -k3,3 | cut -f2-)
+  } | table
+done
+
+section "Summary"
+printf '  %s✖ %d error(s)%s   %s⚠ %d warning(s)%s   %s• %d suggestion(s)%s\n\n' \
+  "$RED$BOLD" "$TOTAL_E" "$RESET" "$YELLOW" "$TOTAL_W" "$RESET" "$BLUE" "$TOTAL_I" "$RESET"
+(( TOTAL_E > 0 )) && exit 2
+(( TOTAL_W > 0 )) && { (( STRICT )) && exit 2 || exit 1; }
+exit 0

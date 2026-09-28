@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# dm-cleanup — show and reclaim unused Docker resources, safely.
+set -euo pipefail
+# shellcheck source=../lib/common.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
+
+usage() {
+  cat <<EOF
+${BOLD}dm-cleanup${RESET} — reclaim disk space from unused Docker resources
+
+${BOLD}Usage:${RESET} dm-cleanup [options]
+
+By default this is a ${BOLD}dry run${RESET}: it lists what would be removed and the space it frees.
+
+${BOLD}Options:${RESET}
+  -x, --execute          Actually remove things (asks for confirmation)
+  -y, --yes              Don't ask for confirmation (implies you meant --execute)
+  -c, --containers       Stopped containers
+  -i, --images           Dangling images (untagged layers)
+  -I, --all-images       All images not used by any container (includes tagged ones)
+  -v, --volumes          Unused volumes  ${RED}(data loss risk!)${RESET}
+  -n, --networks         Unused custom networks
+  -b, --build-cache      Build cache
+      --older-than DUR   Only prune items older than DUR (e.g. 24h, 168h) where supported
+  -h, --help             Show this help
+
+With no category flags, ${BOLD}-c -i -n -b${RESET} are used (volumes are never pruned by default).
+
+${BOLD}Examples:${RESET}
+  dm-cleanup                         # dry-run report
+  dm-cleanup -x                      # prune the safe defaults, with confirmation
+  dm-cleanup -x -I --older-than 168h # remove images unused for a week
+EOF
+}
+
+EXEC=0 C=0 I=0 IA=0 V=0 N=0 B=0 OLDER=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -x|--execute)     EXEC=1 ;;
+    -y|--yes)         EXEC=1; export ASSUME_YES=1 ;;
+    -c|--containers)  C=1 ;;
+    -i|--images)      I=1 ;;
+    -I|--all-images)  I=1; IA=1 ;;
+    -v|--volumes)     V=1 ;;
+    -n|--networks)    N=1 ;;
+    -b|--build-cache) B=1 ;;
+    --older-than)     OLDER="$2"; shift ;;
+    -h|--help)        usage; exit 0 ;;
+    *) die "Unknown option: $1 (see --help)" ;;
+  esac
+  shift
+done
+(( C + I + V + N + B == 0 )) && { C=1; I=1; N=1; B=1; }
+[[ -n "$OLDER" && ! "$OLDER" =~ ^[0-9]+[smh]$ ]] && die "--older-than must look like 30m, 24h, 168h"
+
+need_docker; need jq
+until_f=(); [[ -n "$OLDER" ]] && until_f=(--filter "until=$OLDER")
+
+banner "Docker Cleanup" "$( (( EXEC )) && echo "${RED}EXECUTE mode${RESET}" || echo "dry run — nothing will be removed")${OLDER:+ · older than $OLDER}"
+
+TOTAL_BYTES=0
+declare -a PLAN=()
+
+# ── Stopped containers ──
+if (( C )); then
+  section "Stopped containers"
+  rows=$(docker ps -a --filter status=exited --filter status=created --filter status=dead --format '{{.ID}}' |
+         xargs -r docker inspect --size | jq -r '.[] | [(.Name|ltrimstr("/")), .Config.Image, .State.Status, .State.FinishedAt, (.SizeRw // 0)] | @tsv')
+  if [[ -z "$rows" ]]; then muted "  nothing to remove"
+  else
+    { printf 'NAME\tIMAGE\tSTATE\tSTOPPED\tSIZE\n'
+      while IFS=$'\t' read -r n img st fin sz; do
+        printf '%s\t%s\t%s\t%s\t%s\n' "$n" "$(trunc "$img" 40)" "$(color_state "$st")" "$(ago "$fin")" "$(human_bytes "$sz")"
+      done <<<"$rows"; } | table
+    TOTAL_BYTES=$((TOTAL_BYTES + $(awk -F'\t' '{s+=$5} END{print s+0}' <<<"$rows")))
+    PLAN+=("docker container prune -f ${until_f[*]}")
+  fi
+fi
+
+# ── Images ──
+if (( I )); then
+  if (( IA )); then section "Unused images (all)"; else section "Dangling images"; fi
+  used=$(docker ps -aq | xargs -r docker inspect --format '{{.Image}}' | sort -u)
+  rows=$(docker images -q --no-trunc | sort -u | xargs -r docker image inspect |
+    jq -r --arg used "$used" --argjson all "$IA" '
+      ($used | split("\n")) as $u | .[] | select((.Id as $i | $u | index($i)) | not) |
+      select($all == 1 or ((.RepoTags // []) | length == 0)) |
+      [((.RepoTags // [])[0] // "<none>"), (.Id | ltrimstr("sha256:") | .[0:12]), .Created, .Size] | @tsv')
+  if [[ -z "$rows" ]]; then muted "  nothing to remove"
+  else
+    { printf 'REPOSITORY:TAG\tID\tCREATED\tSIZE\n'
+      while IFS=$'\t' read -r t id cr sz; do
+        printf '%s\t%s\t%s\t%s\n' "$t" "${GREY}${id}${RESET}" "$(ago "$cr")" "$(human_bytes "$sz")"
+      done <<<"$rows"; } | table
+    TOTAL_BYTES=$((TOTAL_BYTES + $(awk -F'\t' '{s+=$4} END{printf "%d", s}' <<<"$rows")))
+    muted "  (shared layers mean actual space freed may be lower)"
+    if (( IA )); then PLAN+=("docker image prune -af ${until_f[*]}"); else PLAN+=("docker image prune -f ${until_f[*]}"); fi
+  fi
+fi
+
+# ── Volumes ──
+if (( V )); then
+  section "Unused volumes"
+  vols=$(docker volume ls -q -f dangling=true)
+  if [[ -z "$vols" ]]; then muted "  nothing to remove"
+  else
+    { printf 'VOLUME\tDRIVER\tPROJECT\tCREATED\tSIZE\n'
+      # shellcheck disable=SC2086
+      docker volume inspect $vols | jq -r '.[] | [.Name, .Driver, (.Labels["com.docker.compose.project"] // "-"), .CreatedAt, .Mountpoint] | @tsv' |
+      while IFS=$'\t' read -r n d p cr mp; do
+        sz=$(du -sb "$mp" 2>/dev/null | cut -f1 || echo 0); sz=${sz:-0}
+        printf '%s\t%s\t%s\t%s\t%s\n' "${YELLOW}$(trunc "$n" 40)${RESET}" "$d" "$p" "$(ago "$cr")" "$(human_bytes "$sz")"
+      done; } | table
+    warn "Volume pruning permanently deletes data. Back up first (see backup.sh)."
+    # 'volume prune' only removes anonymous volumes unless --all (Docker 23+)
+    PLAN+=("docker volume prune -af")
+  fi
+fi
+
+# ── Networks ──
+if (( N )); then
+  section "Unused networks"
+  nets=$(docker network ls --filter type=custom -q | xargs -r docker network inspect |
+    jq -r '.[] | select((.Containers // {}) | length == 0) | [.Name, .Driver, .Created] | @tsv')
+  if [[ -z "$nets" ]]; then muted "  nothing to remove"
+  else
+    { printf 'NETWORK\tDRIVER\tCREATED\n'
+      while IFS=$'\t' read -r n d cr; do printf '%s\t%s\t%s\n' "$n" "$d" "$(ago "$cr")"; done <<<"$nets"; } | table
+    muted "  (networks of stopped compose projects are listed too; they're recreated on 'up')"
+    PLAN+=("docker network prune -f ${until_f[*]}")
+  fi
+fi
+
+# ── Build cache ──
+if (( B )); then
+  section "Build cache"
+  bc=$(docker system df --format '{{if eq .Type "Build Cache"}}{{.Size}}	{{.Reclaimable}}{{end}}' | sed '/^$/d')
+  if [[ -z "$bc" || "$bc" == 0B* ]]; then muted "  nothing to remove"
+  else kv "Size / reclaimable" "$bc"; PLAN+=("docker builder prune -f ${until_f[*]}"); fi
+fi
+
+# ── Plan / execute ──
+section "Plan"
+if (( ${#PLAN[@]} == 0 )); then ok "Nothing to clean up."; echo; exit 0; fi
+kv "Estimated reclaim" "${BOLD}${GREEN}~$(human_bytes "$TOTAL_BYTES")${RESET} ${GREY}(excluding build cache & volumes)${RESET}"
+for p in "${PLAN[@]}"; do printf '  %s$%s %s\n' "$GREY" "$RESET" "$p"; done
+echo
+
+if (( ! EXEC )); then info "Dry run. Re-run with ${BOLD}-x${RESET} to execute."; exit 0; fi
+confirm "Run the ${#PLAN[@]} command(s) above?" || { warn "Aborted."; exit 1; }
+
+before=$(df -P "$(docker info --format '{{.DockerRootDir}}')" | awk 'NR==2{print $4*1024}')
+for p in "${PLAN[@]}"; do
+  step "$p"
+  # shellcheck disable=SC2086
+  out=$($p 2>&1) || { err "Failed: $out"; continue; }
+  sed "/^\s*$/d" <<<"$out" | tail -6 | sed "s/^/    ${GREY}/;s/$/${RESET}/"
+done
+after=$(df -P "$(docker info --format '{{.DockerRootDir}}')" | awk 'NR==2{print $4*1024}')
+echo
+ok "Cleanup complete — disk free changed by ${BOLD}$(human_bytes $(( after > before ? after - before : 0 )))${RESET}"

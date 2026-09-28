@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# dm-monitor — live, color-coded container resource monitor.
+set -euo pipefail
+# shellcheck source=../lib/common.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
+
+usage() {
+  cat <<EOF
+${BOLD}dm-monitor${RESET} — live container resource monitor
+
+${BOLD}Usage:${RESET} dm-monitor [options] [NAME_FILTER]
+
+${BOLD}Options:${RESET}
+  -i, --interval N   Refresh every N seconds (default: 5)
+  -1, --once         Print a single snapshot and exit
+  -s, --sort KEY     Sort by: cpu | mem | name | net | block (default: cpu)
+  -n, --top N        Show only the top N containers
+      --cpu-warn N   CPU % warning threshold  (default: 70)
+      --mem-warn N   Memory % warning threshold (default: 80)
+  -h, --help         Show this help
+
+NAME_FILTER is a substring/regex matched against container names.
+EOF
+}
+
+INTERVAL=5 ONCE=0 SORT=cpu TOP=0 CPU_WARN=70 MEM_WARN=80 FILTER=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -i|--interval) INTERVAL="$2"; shift ;;
+    -1|--once)     ONCE=1 ;;
+    -s|--sort)     SORT="$2"; shift ;;
+    -n|--top)      TOP="$2"; shift ;;
+    --cpu-warn)    CPU_WARN="$2"; shift ;;
+    --mem-warn)    MEM_WARN="$2"; shift ;;
+    -h|--help)     usage; exit 0 ;;
+    -*) die "Unknown option: $1 (see --help)" ;;
+    *)  FILTER="$1" ;;
+  esac
+  shift
+done
+{ [[ "$INTERVAL" =~ ^[0-9]+$ ]] && (( INTERVAL > 0 )); } || die "--interval must be a positive integer"
+[[ "$TOP" =~ ^[0-9]+$ ]] || die "--top must be an integer"
+case "$SORT" in cpu) SK="-k2,2gr" ;; mem) SK="-k4,4gr" ;; name) SK="-k1,1" ;; net) SK="-k5,5gr" ;; block) SK="-k6,6gr" ;;
+  *) die "Invalid --sort '$SORT' (cpu|mem|name|net|block)" ;; esac
+
+need_docker
+
+# Convert docker's "1.2MB" / "3.4GiB" strings to bytes (for sorting).
+to_bytes_awk='function tb(s,  n,u){ n=s+0; u=s; sub(/^[0-9.]+/,"",u)
+  if(u~/^[kK]/)n*=1e3; else if(u~/^Ki/)n*=1024; else if(u~/^MiB/)n*=1048576; else if(u~/^M/)n*=1e6
+  else if(u~/^GiB/)n*=1073741824; else if(u~/^G/)n*=1e9; else if(u~/^TiB/)n*=1099511627776; else if(u~/^T/)n*=1e12
+  return n }'
+
+snapshot() {
+  local raw
+  raw=$(docker stats --no-stream --format '{{.Name}}	{{.CPUPerc}}	{{.MemUsage}}	{{.MemPerc}}	{{.NetIO}}	{{.BlockIO}}	{{.PIDs}}' 2>/dev/null || true)
+  [[ -n "$FILTER" ]] && raw=$(grep -E -- "^[^	]*${FILTER}" <<<"$raw" || true)
+
+  local ncpu hdr
+  ncpu=$(docker info --format '{{.NCPU}}')
+  hdr="$(date '+%H:%M:%S')  ·  ${ncpu} CPUs  ·  sort: ${SORT}  ·  refresh: ${INTERVAL}s"
+  (( ONCE )) && hdr="$(date '+%Y-%m-%d %H:%M:%S')  ·  ${ncpu} CPUs  ·  sort: ${SORT}"
+  banner "Container Monitor" "$hdr"
+
+  if [[ -z "$raw" ]]; then muted "  (no running containers${FILTER:+ matching '$FILTER'})"; return; fi
+
+  # Normalise: name cpu mem mem% netBytes blockBytes net block pids
+  # (no empty fields: tab is IFS whitespace, so `read` would collapse them)
+  local rows
+  rows=$(awk -F'\t' "$to_bytes_awk"'
+    { split($3, m, " / "); split($5, n, " / "); split($6, b, " / ")
+      cpu=$2; sub(/%/,"",cpu); mp=$4; sub(/%/,"",mp)
+      printf "%s\t%s\t%s\t%s\t%.0f\t%.0f\t%s\t%s\t%s\n", $1, cpu, m[1] " / " m[2], mp, tb(n[1])+tb(n[2]), tb(b[1])+tb(b[2]), $5, $6, $7 }' <<<"$raw" |
+    sort -t$'\t' "$SK")
+  (( TOP > 0 )) && rows=$(head -n "$TOP" <<<"$rows")
+
+  local tcpu tmem
+  {
+    printf 'NAME\tCPU\t \tMEM %%\t \tMEM USAGE\tNET I/O\tBLOCK I/O\tPIDS\n'
+    while IFS=$'\t' read -r name cpu mem mp _ _ net blk pids; do
+      local cpu_pct_host
+      cpu_pct_host=$(awk -v c="$cpu" -v n="$ncpu" 'BEGIN{printf "%d", c/n}')
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${BOLD}$(trunc "$name" 32)${RESET}" \
+        "$(bar "$cpu_pct_host" 12)" "$(color_pct "$cpu" "$CPU_WARN" 95)" \
+        "$(bar "$mp" 12)" "$(color_pct "$mp" "$MEM_WARN" 95)" \
+        "$mem" "${CYAN}${net}${RESET}" "${BLUE}${blk}${RESET}" "$pids"
+    done <<<"$rows"
+  } | table
+
+  read -r tcpu tmem < <(awk -F'\t' '{c+=$2; m+=$4} END{printf "%.1f %.1f\n", c, m}' <<<"$rows")
+  echo
+  printf '  %sTotals:%s CPU %s  ·  MEM %s  ·  %s containers\n' "$GREY" "$RESET" \
+    "$(color_pct "$tcpu" $((CPU_WARN*ncpu)) $((95*ncpu)))" "$(color_pct "$tmem" "$MEM_WARN" 95)" "$(wc -l <<<"$rows")"
+  muted "  CPU bar is relative to total host capacity; CPU % column is per-core (docker stats)."
+}
+
+if (( ONCE )); then snapshot; exit 0; fi
+
+cleanup() { tput cnorm 2>/dev/null || true; echo; exit 0; }
+trap cleanup INT TERM
+tput civis 2>/dev/null || true
+while true; do
+  frame=$(snapshot)          # render off-screen first to avoid flicker
+  printf '\e[H\e[2J%s\n' "$frame"
+  muted "  Ctrl-C to exit"
+  sleep "$INTERVAL"
+done

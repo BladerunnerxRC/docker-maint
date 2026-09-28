@@ -1,0 +1,347 @@
+#!/usr/bin/env bash
+# dm-compose-new — scaffold a new compose stack with sensible, production-minded defaults.
+set -euo pipefail
+# shellcheck source=../lib/common.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
+
+TEMPLATES="generic postgres mariadb redis nginx webapp"
+
+usage() {
+  cat <<EOF
+${BOLD}dm-compose-new${RESET} — scaffold a compose stack (compose.yaml + .env + README)
+
+${BOLD}Usage:${RESET} dm-compose-new [options] NAME
+
+${BOLD}Options:${RESET}
+  -t, --template T     One of: ${CYAN}${TEMPLATES}${RESET}  (default: generic)
+  -i, --image IMAGE    Image for the generic template (e.g. ghcr.io/org/app:1.2)
+  -p, --port H:C       Publish a port (repeatable), e.g. -p 8080:80
+  -v, --volume V:PATH  Named volume or bind mount (repeatable), e.g. -v data:/data
+  -e, --env K=V        Environment variable (repeatable; stored in .env)
+  -d, --dir DIR        Parent directory (default: current directory)
+      --tz ZONE        Timezone (default: \$TZ or system zone)
+      --network NAME   Also attach to an existing external network (e.g. a reverse proxy)
+  -f, --force          Overwrite existing files
+  -h, --help           Show this help
+
+If NAME or the generic image is missing and the shell is interactive, you'll be prompted.
+
+${BOLD}Examples:${RESET}
+  dm-compose-new -t postgres mydb
+  dm-compose-new -i louislam/uptime-kuma:1 -p 3001:3001 -v data:/app/data uptime
+  dm-compose-new -t webapp -i ghcr.io/me/api:latest -p 8000:8000 --network proxy api
+EOF
+}
+
+TEMPLATE=generic IMAGE="" DIR="." FORCE=0 NET="" NAME="" PORTS=() VOLS=() ENVS=()
+TZ_VAL="${TZ:-$(cat /etc/timezone 2>/dev/null || timedatectl show -p Timezone --value 2>/dev/null || echo UTC)}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -t|--template) TEMPLATE="$2"; shift ;;
+    -i|--image)    IMAGE="$2"; shift ;;
+    -p|--port)     PORTS+=("$2"); shift ;;
+    -v|--volume)   VOLS+=("$2"); shift ;;
+    -e|--env)      ENVS+=("$2"); shift ;;
+    -d|--dir)      DIR="$2"; shift ;;
+    --tz)          TZ_VAL="$2"; shift ;;
+    --network)     NET="$2"; shift ;;
+    -f|--force)    FORCE=1 ;;
+    -h|--help)     usage; exit 0 ;;
+    -*) die "Unknown option: $1 (see --help)" ;;
+    *)  NAME="$1" ;;
+  esac
+  shift
+done
+
+[[ " $TEMPLATES " == *" $TEMPLATE "* ]] || die "Unknown template '$TEMPLATE'. Choose: $TEMPLATES"
+
+ask() { # ask VAR "prompt" [default]
+  local __v; [[ -t 0 ]] || return 0
+  read -r -p "$(printf '%s ? %s %s%s: ' "$CYAN$BOLD" "$RESET" "$2" "${3:+ ${GREY}[$3]${RESET}}")" __v
+  printf -v "$1" '%s' "${__v:-${3:-}}"
+}
+[[ -z "$NAME" ]] && ask NAME "Stack name"
+[[ -z "$NAME" ]] && { usage >&2; die "NAME is required"; }
+[[ "$NAME" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "NAME must be lowercase letters, digits, '-' or '_'"
+if [[ "$TEMPLATE" == generic || "$TEMPLATE" == webapp ]] && [[ -z "$IMAGE" ]]; then
+  ask IMAGE "Container image" "nginx:alpine"
+  [[ -z "$IMAGE" ]] && die "--image is required for the $TEMPLATE template"
+fi
+[[ "$IMAGE" == *:latest || ( -n "$IMAGE" && "$IMAGE" != *:* && "$IMAGE" != *@* ) ]] && \
+  warn "Image '$IMAGE' uses an implicit/latest tag — pin a version for reproducible deploys."
+
+TARGET="$DIR/$NAME"
+if [[ -e "$TARGET/compose.yaml" && $FORCE -eq 0 ]]; then die "$TARGET/compose.yaml exists (use --force to overwrite)"; fi
+mkdir -p "$TARGET"
+
+gen_secret() { head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24; }
+
+# ── Shared YAML snippets ─────────────────────────────────────────────────
+LOGGING='    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"'
+COMMON_ENV='      TZ: ${TZ}'
+
+ports_yaml() { (( $# )) || return 0; echo "    ports:"; for p in "$@"; do echo "      - \"$p\""; done; }
+vols_yaml()  { (( $# )) || return 0; echo "    volumes:"; for v in "$@"; do echo "      - $v"; done; }
+env_yaml()   { for e in "$@"; do echo "      ${e%%=*}: \${${e%%=*}}"; done; }
+named_vols() { for v in "$@"; do local s="${v%%:*}"; [[ "$s" != .* && "$s" != /* && "$s" != ~* ]] && echo "$s"; done | sort -u; return 0; }
+nets_yaml()  { echo "    networks:"; echo "      - default"; [[ -n "$NET" ]] && echo "      - $NET"; return 0; }
+
+# ── Templates → services YAML, env lines, named volumes ──────────────────
+SERVICES="" ENV_LINES=() EXTRA_VOLS=()
+case "$TEMPLATE" in
+generic)
+  SERVICES="  ${NAME}:
+    image: ${IMAGE}
+    container_name: ${NAME}
+    restart: unless-stopped
+$(ports_yaml "${PORTS[@]}")
+    environment:
+${COMMON_ENV}
+$(env_yaml "${ENVS[@]}")
+$(vols_yaml "${VOLS[@]}")
+$(nets_yaml)
+    # healthcheck:
+    #   test: [\"CMD-SHELL\", \"wget -qO- http://localhost/ || exit 1\"]
+    #   interval: 30s
+    #   timeout: 5s
+    #   retries: 3
+    #   start_period: 20s
+${LOGGING}"
+  ;;
+postgres)
+  (( ${#PORTS[@]} )) || PORTS=("127.0.0.1:5432:5432")
+  ENV_LINES=("POSTGRES_USER=${NAME}" "POSTGRES_DB=${NAME}" "POSTGRES_PASSWORD=$(gen_secret)")
+  EXTRA_VOLS=("db_data")
+  SERVICES="  db:
+    image: postgres:17-alpine
+    container_name: ${NAME}-db
+    restart: unless-stopped
+$(ports_yaml "${PORTS[@]}")
+    environment:
+${COMMON_ENV}
+      POSTGRES_USER: \${POSTGRES_USER}
+      POSTGRES_DB: \${POSTGRES_DB}
+      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD}
+$(env_yaml "${ENVS[@]}")
+    volumes:
+      - db_data:/var/lib/postgresql/data
+$(nets_yaml)
+    healthcheck:
+      test: [\"CMD-SHELL\", \"pg_isready -U \$\${POSTGRES_USER} -d \$\${POSTGRES_DB}\"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    shm_size: 256m
+${LOGGING}"
+  ;;
+mariadb)
+  (( ${#PORTS[@]} )) || PORTS=("127.0.0.1:3306:3306")
+  ENV_LINES=("MARIADB_DATABASE=${NAME}" "MARIADB_USER=${NAME}" "MARIADB_PASSWORD=$(gen_secret)" "MARIADB_ROOT_PASSWORD=$(gen_secret)")
+  EXTRA_VOLS=("db_data")
+  SERVICES="  db:
+    image: mariadb:11
+    container_name: ${NAME}-db
+    restart: unless-stopped
+$(ports_yaml "${PORTS[@]}")
+    environment:
+${COMMON_ENV}
+      MARIADB_DATABASE: \${MARIADB_DATABASE}
+      MARIADB_USER: \${MARIADB_USER}
+      MARIADB_PASSWORD: \${MARIADB_PASSWORD}
+      MARIADB_ROOT_PASSWORD: \${MARIADB_ROOT_PASSWORD}
+$(env_yaml "${ENVS[@]}")
+    volumes:
+      - db_data:/var/lib/mysql
+$(nets_yaml)
+    healthcheck:
+      test: [\"CMD\", \"healthcheck.sh\", \"--connect\", \"--innodb_initialized\"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+${LOGGING}"
+  ;;
+redis)
+  (( ${#PORTS[@]} )) || PORTS=("127.0.0.1:6379:6379")
+  ENV_LINES=("REDIS_PASSWORD=$(gen_secret)")
+  EXTRA_VOLS=("redis_data")
+  SERVICES="  redis:
+    image: redis:7-alpine
+    container_name: ${NAME}-redis
+    restart: unless-stopped
+    command: [\"redis-server\", \"--appendonly\", \"yes\", \"--requirepass\", \"\${REDIS_PASSWORD}\"]
+$(ports_yaml "${PORTS[@]}")
+    environment:
+${COMMON_ENV}
+      REDIS_PASSWORD: \${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+$(nets_yaml)
+    healthcheck:
+      test: [\"CMD-SHELL\", \"redis-cli -a \\\"\$\$REDIS_PASSWORD\\\" --no-auth-warning ping | grep -q PONG\"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+${LOGGING}"
+  ;;
+nginx)
+  (( ${#PORTS[@]} )) || PORTS=("80:80")
+  mkdir -p "$TARGET/conf.d" "$TARGET/html"
+  [[ -f "$TARGET/html/index.html" ]] || echo "<h1>${NAME} is up</h1>" > "$TARGET/html/index.html"
+  [[ -f "$TARGET/conf.d/default.conf" ]] || cat > "$TARGET/conf.d/default.conf" <<'NGINX'
+server {
+    listen 80;
+    server_name _;
+    root /usr/share/nginx/html;
+    location / { try_files $uri $uri/ =404; }
+    location = /healthz { access_log off; return 200 "ok\n"; }
+}
+NGINX
+  SERVICES="  web:
+    image: nginx:1-alpine
+    container_name: ${NAME}-web
+    restart: unless-stopped
+$(ports_yaml "${PORTS[@]}")
+    environment:
+${COMMON_ENV}
+$(env_yaml "${ENVS[@]}")
+    volumes:
+      - ./conf.d:/etc/nginx/conf.d:ro
+      - ./html:/usr/share/nginx/html:ro
+$(nets_yaml)
+    healthcheck:
+      test: [\"CMD-SHELL\", \"wget -qO- http://127.0.0.1/healthz || exit 1\"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+${LOGGING}"
+  ;;
+webapp)
+  (( ${#PORTS[@]} )) || PORTS=("8000:8000")
+  DBPASS=$(gen_secret)
+  ENV_LINES=("POSTGRES_USER=${NAME}" "POSTGRES_DB=${NAME}" "POSTGRES_PASSWORD=${DBPASS}"
+             "DATABASE_URL=postgresql://${NAME}:${DBPASS}@db:5432/${NAME}" "REDIS_URL=redis://redis:6379/0")
+  EXTRA_VOLS=("db_data" "redis_data")
+  SERVICES="  app:
+    image: ${IMAGE}
+    container_name: ${NAME}-app
+    restart: unless-stopped
+$(ports_yaml "${PORTS[@]}")
+    environment:
+${COMMON_ENV}
+      DATABASE_URL: \${DATABASE_URL}
+      REDIS_URL: \${REDIS_URL}
+$(env_yaml "${ENVS[@]}")
+$(vols_yaml "${VOLS[@]}")
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+$(nets_yaml)
+${LOGGING}
+#--
+  db:
+    image: postgres:17-alpine
+    container_name: ${NAME}-db
+    restart: unless-stopped
+    environment:
+${COMMON_ENV}
+      POSTGRES_USER: \${POSTGRES_USER}
+      POSTGRES_DB: \${POSTGRES_DB}
+      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [\"CMD-SHELL\", \"pg_isready -U \$\${POSTGRES_USER} -d \$\${POSTGRES_DB}\"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+${LOGGING}
+#--
+  redis:
+    image: redis:7-alpine
+    container_name: ${NAME}-redis
+    restart: unless-stopped
+    command: [\"redis-server\", \"--appendonly\", \"yes\"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: [\"CMD\", \"redis-cli\", \"ping\"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+${LOGGING}"
+  ;;
+esac
+
+# ── compose.yaml ─────────────────────────────────────────────────────────
+mapfile -t ALLVOLS < <( { named_vols "${VOLS[@]}"; printf '%s\n' "${EXTRA_VOLS[@]}"; } | sed '/^$/d' | sort -u)
+{
+  echo "# ${NAME} — generated by dm-compose-new (${TEMPLATE} template) on $(date +%Y-%m-%d)"
+  echo "# Deploy:  docker compose up -d      Logs: docker compose logs -f"
+  echo "name: ${NAME}"
+  echo
+  echo "services:"
+  # empty helper expansions leave blank lines; '#--' marks intentional service separators
+  grep -v '^[[:space:]]*$' <<<"$SERVICES" | sed 's/^#--$//'
+  if (( ${#ALLVOLS[@]} )); then echo; echo "volumes:"; for v in "${ALLVOLS[@]}"; do echo "  ${v}:"; done; fi
+  if [[ -n "$NET" ]]; then echo; echo "networks:"; echo "  ${NET}:"; echo "    external: true"; fi
+} > "$TARGET/compose.yaml"
+
+# ── .env (never overwrite existing secrets) ─────────────────────────────
+if [[ -f "$TARGET/.env" && $FORCE -eq 0 ]]; then
+  warn ".env already exists — left untouched"
+else
+  {
+    echo "# ${NAME} environment — keep this file out of version control"
+    echo "TZ=${TZ_VAL}"
+    for e in "${ENV_LINES[@]}" "${ENVS[@]}"; do [[ -n "$e" ]] && echo "$e"; done
+  } > "$TARGET/.env"
+  chmod 600 "$TARGET/.env"
+fi
+[[ -f "$TARGET/.gitignore" ]] || printf '.env\n' > "$TARGET/.gitignore"
+
+# ── README ───────────────────────────────────────────────────────────────
+[[ -f "$TARGET/README.md" && $FORCE -eq 0 ]] || cat > "$TARGET/README.md" <<EOF
+# ${NAME}
+
+Generated with \`dm-compose-new -t ${TEMPLATE}\`.
+
+| Command | Purpose |
+|---|---|
+| \`docker compose up -d\` | Start / apply changes |
+| \`docker compose ps\` | Status |
+| \`docker compose logs -f\` | Follow logs |
+| \`docker compose pull && docker compose up -d\` | Update images |
+| \`docker compose down\` | Stop (volumes are kept) |
+
+Secrets live in \`.env\` (mode 600, git-ignored).
+EOF
+
+# ── Validate & report ────────────────────────────────────────────────────
+banner "Stack created: ${NAME}" "template: ${TEMPLATE} · ${TARGET}"
+section "Files"
+for f in compose.yaml .env .gitignore README.md conf.d/default.conf html/index.html; do
+  [[ -f "$TARGET/$f" ]] && printf '  %s•%s %-22s %s%s%s\n' "$CYAN" "$RESET" "$f" "$GREY" "$(wc -l <"$TARGET/$f") lines" "$RESET"
+done
+
+section "Validation"
+if cc=$(compose_cmd 2>/dev/null); then
+  if [[ -n "$NET" ]] && ! docker network inspect "$NET" >/dev/null 2>&1; then
+    warn "External network '${NET}' does not exist yet: docker network create ${NET}"
+  fi
+  if msg=$(cd "$TARGET" && $cc config -q 2>&1); then ok "compose.yaml is valid"
+  else err "compose config failed:"; sed "s/^/    /" <<<"$msg"; fi
+else
+  warn "docker compose not found — skipped validation"
+fi
+
+section "Next steps"
+printf '  %s$%s cd %s\n' "$GREY" "$RESET" "$TARGET"
+printf '  %s$%s %s .env compose.yaml   %s# review%s\n' "$GREY" "$RESET" "${EDITOR:-nano}" "$GREY" "$RESET"
+printf '  %s$%s docker compose up -d\n\n' "$GREY" "$RESET"
