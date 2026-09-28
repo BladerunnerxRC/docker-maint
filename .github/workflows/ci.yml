@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_COLOR: "1"      # dm tools emit ANSI colors; GitHub renders them in the log
+  COLUMNS: "120"
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: shellcheck (warnings and above)
+        run: |
+          shellcheck --version | head -2
+          shellcheck -x -S warning lib/common.sh bin/* backup.sh restore.sh tests/*.sh
+
+  compose-lint:
+    name: Compose lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Validate & audit compose files
+        # exit 1 on warnings, 2 on errors — suppress accepted findings in-file with
+        #   # dm-compose-lint: disable=<rule>[@service]
+        run: bin/dm-compose-lint -q .
+
+  smoke:
+    name: Smoke test (live Docker)
+    runs-on: ubuntu-latest
+    needs: shellcheck
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run toolkit end-to-end
+        run: tests/smoke.sh
