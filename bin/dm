@@ -10,6 +10,8 @@ COMMANDS=(
   "status|Admin|Host overview: engine, counts, containers, disk usage, alerts"
   "images|Admin|Image inventory and registry update check"
   "cleanup|Admin|Dry-run-first pruning of unused resources"
+  "backup|Backup|Back up volumes chosen by label, project or name (manifest, checksums, retention)"
+  "restore|Backup|Restore volumes from a backup run, restart & health-check their containers"
   "health|Monitor|Container health report (exit 0/1/2 for cron & alerting)"
   "monitor|Monitor|Live CPU / memory / IO dashboard"
   "logs|Monitor|Scan logs for errors, or tail many containers at once"

@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# dm-restore — restore Docker volumes from dm-backup runs (or legacy single archives).
+set -euo pipefail
+# shellcheck source=../lib/common.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
+
+usage() {
+  cat <<EOF
+${BOLD}dm-restore${RESET} — restore Docker volumes from a dm-backup run
+
+${BOLD}Usage:${RESET}
+  dm-restore [options] [VOLUME...]            Restore volumes from a run (default: all in the run)
+  dm-restore --list                           List available runs
+  dm-restore --file ARCHIVE --volume NAME     Restore a single .tar.gz (e.g. legacy backup.sh archives)
+
+${BOLD}Options:${RESET}
+  -d, --dest DIR         Backup root (default: \$DM_BACKUP_DIR or /mnt/nas_backups)
+  -r, --run ID           Run to restore, e.g. 20250101-020000 (default: latest)
+  -L, --list             List runs and their volumes
+      --as NAME          Restore a single volume under a different name (safe test restores)
+      --file ARCHIVE     Restore this archive instead of a run (needs --volume)
+      --volume NAME      Target volume for --file
+      --up               Afterwards, 'docker compose up -d' projects whose containers no longer exist
+      --no-start         Leave stopped containers stopped
+      --no-verify        Skip SHA256 verification
+  -t, --timeout SEC      Wait up to SEC for restarted containers to be running/healthy (default: 120)
+  -y, --yes              Don't ask for confirmation
+  -n, --dry-run          Show the plan only
+  -h, --help             Show this help
+
+${RED}${BOLD}Restoring replaces the entire contents of each target volume.${RESET}
+Containers using a target volume are stopped first and started again afterwards.
+EOF
+}
+
+DEST="${DM_BACKUP_DIR:-/mnt/nas_backups}" RUN_ID="" LIST=0 AS="" FILE="" FVOL="" UP=0 START=1 VERIFY=1 TIMEOUT=120 DRY=0
+HELPER="${DM_HELPER_IMAGE:-busybox:1.37}"
+NAMES=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -d|--dest)    DEST="$2"; shift ;;
+    -r|--run)     RUN_ID="$2"; shift ;;
+    -L|--list)    LIST=1 ;;
+    --as)         AS="$2"; shift ;;
+    --file)       FILE="$2"; shift ;;
+    --volume)     FVOL="$2"; shift ;;
+    --up)         UP=1 ;;
+    --no-start)   START=0 ;;
+    --no-verify)  VERIFY=0 ;;
+    -t|--timeout) TIMEOUT="$2"; shift ;;
+    -y|--yes)     export ASSUME_YES=1 ;;
+    -n|--dry-run) DRY=1 ;;
+    -h|--help)    usage; exit 0 ;;
+    -*) die "Unknown option: $1 (see --help)" ;;
+    *)  NAMES+=("$1") ;;
+  esac
+  shift
+done
+
+need jq sha256sum
+
+list_runs() { find "$DEST" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended -regex '.*/[0-9]{8}-[0-9]{6}' 2>/dev/null | sort; }
+
+# ── --list ───────────────────────────────────────────────────────────────
+if (( LIST )); then
+  banner "Backup Runs" "$DEST"
+  mapfile -t runs < <(list_runs)
+  (( ${#runs[@]} )) || { muted "  (no runs found)"; exit 0; }
+  {
+    printf 'RUN\tAGE\tSIZE\tVOLUMES\n'
+    for r in "${runs[@]}"; do
+      id=$(basename "$r")
+      ts=$(sed -E 's/(....)(..)(..)-(..)(..)(..)/\1-\2-\3 \4:\5:\6/' <<<"$id")
+      vols="${GREY}(no manifest)${RESET}"
+      [[ -f "$r/manifest.json" ]] && vols=$(jq -r '[.volumes[].name] | join(", ")' "$r/manifest.json")
+      printf '%s\t%s\t%s\t%s\n' "${BOLD}${id}${RESET}" "$(ago "$ts")" "$(du -sh "$r" | cut -f1)" "$(trunc "$vols" 60)"
+    done
+  } | table
+  echo; exit 0
+fi
+
+need_docker
+
+# ── Build the plan: rows of  volume \t archive \t target \t manifest-json ──
+PLAN=()
+if [[ -n "$FILE" ]]; then
+  [[ -n "$FVOL" ]] || die "--file needs --volume NAME"
+  [[ -f "$FILE" ]] || die "Archive not found: $FILE"
+  PLAN+=("$FVOL"$'\t'"$(readlink -f "$FILE")"$'\t'"$FVOL"$'\t''{}')
+  RUN="" SOURCE="$FILE"
+else
+  if [[ -z "$RUN_ID" || "$RUN_ID" == latest ]]; then RUN=$(list_runs | tail -1)
+  else RUN="$DEST/$RUN_ID"; fi
+  [[ -n "$RUN" && -f "$RUN/manifest.json" ]] || die "No backup run found (${RUN:-$DEST}). Use --list to see runs."
+  SOURCE="$RUN"
+  mapfile -t avail < <(jq -r '.volumes[].name' "$RUN/manifest.json")
+  (( ${#NAMES[@]} )) || NAMES=("${avail[@]}")
+  for v in "${NAMES[@]}"; do
+    printf '%s\n' "${avail[@]}" | grep -qxF -- "$v" || die "Volume '$v' is not in run $(basename "$RUN") (has: ${avail[*]})"
+    meta=$(jq -c --arg v "$v" '.volumes[] | select(.name == $v)' "$RUN/manifest.json")
+    PLAN+=("$v"$'\t'"$RUN/$(jq -r .file <<<"$meta")"$'\t'"$v"$'\t'"$meta")
+  done
+fi
+if [[ -n "$AS" ]]; then
+  (( ${#PLAN[@]} == 1 )) || die "--as works with exactly one volume"
+  IFS=$'\t' read -r v a _ m <<<"${PLAN[0]}"; PLAN=("$v"$'\t'"$a"$'\t'"$AS"$'\t'"$m")
+fi
+
+banner "Docker Volume Restore" "from ${SOURCE}$( (( DRY )) && echo '  ·  DRY RUN')"
+
+section "Plan"
+{
+  printf 'SOURCE VOLUME\tTARGET\tARCHIVE SIZE\tTARGET EXISTS\tCONTAINERS TO STOP\n'
+  for row in "${PLAN[@]}"; do
+    IFS=$'\t' read -r v a t _ <<<"$row"
+    [[ -f "$a" ]] || die "Missing archive: $a"
+    exists="${GREEN}no (create)${RESET}"; docker volume inspect "$t" >/dev/null 2>&1 && exists="${YELLOW}yes (overwrite)${RESET}"
+    users=$(docker ps --filter "volume=$t" --format '{{.Names}}' | paste -sd, -)
+    printf '%s\t%s\t%s\t%s\t%s\n' "$v" "${BOLD}${t}${RESET}" "$(human_bytes "$(stat -c %s "$a")")" "$exists" "${users:-${GREY}-${RESET}}"
+  done
+} | table
+
+# ── Verify checksums ──
+if (( VERIFY )) && [[ -n "$RUN" && -f "$RUN/SHA256SUMS" ]]; then
+  section "Verify"
+  for row in "${PLAN[@]}"; do
+    IFS=$'\t' read -r _ a _ _ <<<"$row"
+    f=$(basename "$a")
+    if (cd "$RUN" && grep -F "  $f" SHA256SUMS | sha256sum -c --status); then ok "$f checksum OK"
+    else die "$f checksum mismatch — archive is corrupt (use --no-verify to force)"; fi
+  done
+elif (( VERIFY )); then
+  muted "  (no SHA256SUMS — skipping verification)"
+fi
+
+(( DRY )) && { echo; info "Dry run — nothing changed."; exit 0; }
+echo
+confirm "Replace the contents of ${#PLAN[@]} volume(s)?" || { warn "Aborted."; exit 1; }
+docker image inspect "$HELPER" >/dev/null 2>&1 || docker pull -q "$HELPER" >/dev/null ||
+  die "Cannot pull helper image $HELPER (set DM_HELPER_IMAGE to a local image)"
+
+STOPPED=()
+wait_ready() {  # wait_ready CONTAINER...  → 0 when all running (and healthy if they have a healthcheck)
+  local deadline=$(( $(date +%s) + TIMEOUT )) c st shown=0 pending failed
+  while :; do
+    pending=() failed=()
+    for c in "$@"; do
+      st=$(docker inspect -f '{{.State.Status}}/{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$c" 2>/dev/null || echo "gone/none")
+      case "$st" in
+        running/healthy|running/none) ;;
+        running/starting|created/*|restarting/*) pending+=("$c=$st") ;;
+        *) failed+=("$c=$st") ;;                       # unhealthy, exited, dead, gone
+      esac
+    done
+    (( shown )) && [[ -t 1 ]] && printf '\r\e[K'
+    if (( ${#failed[@]} )); then err "Not healthy: ${failed[*]}"; return 1; fi
+    (( ${#pending[@]} == 0 )) && { ok "Ready: $*"; return 0; }
+    if (( $(date +%s) >= deadline )); then err "Not ready after ${TIMEOUT}s: ${pending[*]}"; return 1; fi
+    if [[ -t 1 ]]; then printf '  %s⏳ waiting: %s%s' "$GREY" "${pending[*]}" "$RESET"
+    elif (( ! shown )); then muted "  ⏳ waiting for: ${pending[*]}"; fi
+    shown=1; sleep 3
+  done
+}
+
+section "Restoring"
+failures=0
+for row in "${PLAN[@]}"; do
+  IFS=$'\t' read -r v a t meta <<<"$row"
+  step "${BOLD}${t}${RESET} ${GREY}← $(basename "$a")${RESET}"
+
+  mapfile -t users < <(docker ps --filter "volume=$t" --format '{{.Names}}')
+  for c in "${users[@]}"; do docker stop "$c" >/dev/null && STOPPED+=("$c") && muted "    stopped $c"; done
+
+  if ! docker volume inspect "$t" >/dev/null 2>&1; then
+    args=(--driver "$(jq -r '.driver // "local"' <<<"$meta")")
+    while IFS= read -r l; do args+=(--label "$l"); done < <(jq -r '(.labels // {}) | to_entries[] | "\(.key)=\(.value)"' <<<"$meta")
+    while IFS= read -r o; do args+=(--opt "$o"); done < <(jq -r '(.options // {}) | to_entries[] | "\(.key)=\(.value)"' <<<"$meta")
+    [[ "$t" != "$v" ]] && args=(--driver "${args[1]}")   # renamed restore: don't claim compose ownership
+    docker volume create "${args[@]}" "$t" >/dev/null && muted "    created volume $t"
+  fi
+
+  start=$(date +%s); errf=$(mktemp)
+  if docker run --rm -i --network none -v "$t:/volume" "$HELPER" \
+       sh -c 'rm -rf /volume/..?* /volume/.[!.]* /volume/* && tar -xzf - -C /volume' <"$a" 2>"$errf"; then
+    printf '    %s✔ restored%s %s(%ds)%s\n' "$GREEN" "$RESET" "$GREY" $(( $(date +%s) - start )) "$RESET"
+  else
+    err "    restore failed: $(tr '\n' ' ' <"$errf")"; failures=$((failures + 1))
+  fi
+  rm -f "$errf"
+done
+
+# ── Restart & health ──
+if (( START )) && (( ${#STOPPED[@]} )); then
+  section "Restarting"
+  mapfile -t STOPPED < <(printf '%s\n' "${STOPPED[@]}" | sort -u)
+  docker start "${STOPPED[@]}" >/dev/null || err "Some containers failed to start"
+  wait_ready "${STOPPED[@]}" || failures=$((failures + 1))
+elif (( ${#STOPPED[@]} )); then
+  warn "Left stopped (--no-start): ${STOPPED[*]}"
+fi
+
+# ── Bring back projects whose containers are gone ──
+if (( UP )) && [[ -n "$RUN" ]]; then
+  section "Compose projects"
+  cc=$(compose_cmd) || die "docker compose not available for --up"
+  while IFS=$'\t' read -r p wd files; do
+    [[ -z "$p" ]] && continue
+    if docker ps -a --filter "label=com.docker.compose.project=$p" -q | grep -q .; then
+      muted "  $p: containers exist — restarted above"; continue
+    fi
+    fargs=()
+    IFS=',' read -ra fl <<<"$files"
+    for f in "${fl[@]}"; do
+      if [[ -r "$f" ]]; then fargs+=(-f "$f")
+      elif [[ -r "$RUN/compose/$p/$(basename "$f")" ]]; then fargs+=(-f "$RUN/compose/$p/$(basename "$f")"); fi
+    done
+    (( ${#fargs[@]} )) || { warn "$p: no compose file available"; continue; }
+    pd=(); [[ -d "$wd" ]] && pd=(--project-directory "$wd")
+    step "$cc -p $p up -d"
+    # shellcheck disable=SC2086
+    if $cc -p "$p" "${pd[@]}" "${fargs[@]}" up -d 2>&1 | sed "s/^/    ${GREY}/;s/$/${RESET}/"; then
+      mapfile -t pc < <(docker ps -a --filter "label=com.docker.compose.project=$p" --format '{{.Names}}')
+      (( ${#pc[@]} )) && { wait_ready "${pc[@]}" || failures=$((failures + 1)); }
+    else failures=$((failures + 1)); fi
+  done < <(jq -r '(.projects // [])[] | [.name, (.working_dir // ""), (.config_files | join(","))] | @tsv' "$RUN/manifest.json")
+fi
+
+echo
+if (( failures == 0 )); then ok "Restore complete"; else err "Restore finished with $failures problem(s)"; exit 1; fi
