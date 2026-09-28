@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+# dm-backup — back up Docker volumes (label/project/name driven) with manifest, checksums and retention.
+set -euo pipefail
+# shellcheck source=../lib/common.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
+
+usage() {
+  cat <<EOF
+${BOLD}dm-backup${RESET} — back up Docker volumes
+
+${BOLD}Usage:${RESET} dm-backup [options] [VOLUME...]
+
+${BOLD}Selecting volumes${RESET} (combine freely; default is ${BOLD}--label${RESET}):
+  VOLUME...              Named volumes
+  -p, --project NAME     All named volumes used by a compose project (repeatable)
+  -l, --label            Volumes of containers labelled ${CYAN}docker-maint.backup=true${RESET}
+  -a, --all              Every named volume attached to any container
+  Containers labelled ${CYAN}docker-maint.backup=false${RESET} are always skipped (unless named explicitly).
+
+${BOLD}Options:${RESET}
+  -d, --dest DIR         Backup root (default: \$DM_BACKUP_DIR or /mnt/nas_backups)
+  -k, --keep N           Keep the newest N runs, delete older ones (default: \$DM_BACKUP_KEEP or 7)
+  -s, --stop             Stop containers using a volume while it is archived (consistent DB copies).
+                         Also enabled per container with label ${CYAN}docker-maint.backup.stop=true${RESET}
+      --log FILE         Also append output (without colors) to FILE
+  -n, --dry-run          Show what would be backed up
+  -h, --help             Show this help
+
+${BOLD}Layout:${RESET}  DIR/<YYYYmmdd-HHMMSS>/
+          ├── <volume>.tar.gz     archive of the volume contents
+          ├── manifest.json       volume driver/labels, containers, projects, sizes
+          ├── SHA256SUMS          checksums (verified by dm-restore)
+          └── compose/<project>/  compose files of involved projects (when readable)
+
+Archives are streamed through a throwaway ${BOLD}\$DM_HELPER_IMAGE${RESET} (default busybox:1.37) container,
+so dm-backup also works when run inside a container with only the Docker socket.
+
+${BOLD}Examples:${RESET}
+  dm-backup -p grafana -p jira
+  dm-backup --label --stop --keep 14 -d /mnt/nas_backups
+  dm-backup comixed_data grafana_data
+EOF
+}
+
+DEST="${DM_BACKUP_DIR:-/mnt/nas_backups}" KEEP="${DM_BACKUP_KEEP:-7}" STOP=0 DRY=0 LOG="" LABEL=0 ALL=0
+HELPER="${DM_HELPER_IMAGE:-busybox:1.37}"
+PROJECTS=() NAMES=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -p|--project) PROJECTS+=("$2"); shift ;;
+    -l|--label)   LABEL=1 ;;
+    -a|--all)     ALL=1 ;;
+    -d|--dest)    DEST="$2"; shift ;;
+    -k|--keep)    KEEP="$2"; shift ;;
+    -s|--stop)    STOP=1 ;;
+    --log)        LOG="$2"; shift ;;
+    -n|--dry-run) DRY=1 ;;
+    -h|--help)    usage; exit 0 ;;
+    -*) die "Unknown option: $1 (see --help)" ;;
+    *)  NAMES+=("$1") ;;
+  esac
+  shift
+done
+[[ "$KEEP" =~ ^[0-9]+$ ]] || die "--keep must be a number (0 = keep all)"
+(( ${#NAMES[@]} + ${#PROJECTS[@]} + ALL == 0 )) && LABEL=1
+
+if [[ -n "$LOG" ]]; then
+  mkdir -p "$(dirname "$LOG")"
+  exec > >(tee >(sed -u 's/\x1b\[[0-9;]*m//g' >>"$LOG")) 2>&1
+fi
+
+need_docker; need jq sha256sum
+
+# ── Build the volume → containers map from all containers ────────────────
+containers=$(docker ps -aq | xargs -r docker inspect)
+[[ -n "$containers" ]] || containers='[]'
+# rows: volume \t container \t project \t running \t stop-label \t backup-label
+mapfile -t ROWS < <(jq -r '.[] | . as $c | ($c.Name | ltrimstr("/")) as $n | ($c.Config.Labels // {}) as $l |
+  $c.Mounts[]? | select(.Type == "volume" and (.Name | test("^[0-9a-f]{64}$") | not)) |
+  [.Name, $n, ($l["com.docker.compose.project"] // "-"), (if $c.State.Running then "1" else "0" end),
+   ($l["docker-maint.backup.stop"] // "false"), ($l["docker-maint.backup"] // "-")] | @tsv' <<<"$containers")
+
+declare -A SEL=()     # volume → reason
+for v in "${NAMES[@]}"; do
+  docker volume inspect "$v" >/dev/null 2>&1 || die "Volume not found: $v"
+  SEL[$v]="named"
+done
+for r in "${ROWS[@]}"; do
+  IFS=$'\t' read -r vol _ proj _ _ blabel <<<"$r"
+  [[ "$blabel" == "false" && -z "${SEL[$vol]:-}" ]] && continue
+  if (( ALL )); then SEL[$vol]="${SEL[$vol]:-all}"; fi
+  if (( LABEL )) && [[ "$blabel" == "true" ]]; then SEL[$vol]="${SEL[$vol]:-label}"; fi
+  for p in "${PROJECTS[@]}"; do [[ "$proj" == "$p" ]] && SEL[$vol]="${SEL[$vol]:-project:$p}"; done
+done
+# Honour docker-maint.backup=false for non-explicit selections
+for r in "${ROWS[@]}"; do
+  IFS=$'\t' read -r vol _ _ _ _ blabel <<<"$r"
+  [[ "$blabel" == "false" && "${SEL[$vol]:-}" != "named" ]] && unset "SEL[$vol]"
+done
+for p in "${PROJECTS[@]}"; do
+  printf '%s\n' "${ROWS[@]}" | cut -f3 | grep -qxF -- "$p" || warn "No volumes found for project '$p'"
+done
+
+if (( ${#SEL[@]} == 0 )); then
+  (( LABEL )) && info "Tip: add the label ${CYAN}docker-maint.backup=true${RESET} to containers, or pass -p/-a/VOLUME."
+  die "No volumes selected"
+fi
+mapfile -t VOLS < <(printf '%s\n' "${!SEL[@]}" | sort)
+
+users_of() { printf '%s\n' "${ROWS[@]}" | awk -F'\t' -v v="$1" '$1 == v'; }
+
+STAMP=$(date +%Y%m%d-%H%M%S)
+RUN="$DEST/$STAMP"
+banner "Docker Volume Backup" "${#VOLS[@]} volume(s) → ${RUN}$( (( DRY )) && echo '  ·  DRY RUN')"
+
+section "Plan"
+{
+  printf 'VOLUME\tSELECTED BY\tUSED BY\tSTOP\n'
+  for v in "${VOLS[@]}"; do
+    u=$(users_of "$v" | cut -f2 | sort -u | paste -sd, -); stop="no"
+    if (( STOP )) || users_of "$v" | awk -F'\t' '$5 == "true"' | grep -q .; then
+      users_of "$v" | awk -F'\t' '$4 == 1' | grep -q . && stop="${YELLOW}yes${RESET}"
+    fi
+    printf '%s\t%s\t%s\t%s\n' "${BOLD}${v}${RESET}" "${GREY}${SEL[$v]}${RESET}" "$(trunc "${u:--}" 40)" "$stop"
+  done
+} | table
+
+(( DRY )) && { echo; info "Dry run — nothing written."; exit 0; }
+
+# ── Run ──────────────────────────────────────────────────────────────────
+mkdir -p "$RUN" || die "Cannot create $RUN"
+docker image inspect "$HELPER" >/dev/null 2>&1 || { step "Pulling helper image $HELPER"
+  docker pull -q "$HELPER" >/dev/null || die "Cannot pull helper image $HELPER (set DM_HELPER_IMAGE to a local image)"; }
+
+STOPPED=()
+restart_stopped() {
+  (( ${#STOPPED[@]} )) || return 0
+  step "Restarting: ${STOPPED[*]}"
+  docker start "${STOPPED[@]}" >/dev/null || err "Failed to restart some containers: ${STOPPED[*]}"
+  STOPPED=()
+}
+trap 'restart_stopped' EXIT
+trap 'err "Interrupted"; exit 130' INT TERM
+
+section "Backing up"
+failures=0 total=0
+manifest_vols='[]'
+for v in "${VOLS[@]}"; do
+  # Stop running users when requested (globally or via label)
+  mapfile -t running < <(users_of "$v" | awk -F'\t' -v s="$STOP" '$4 == 1 && (s == 1 || $5 == "true") {print $2}' | sort -u)
+  for c in "${running[@]}"; do
+    [[ " ${STOPPED[*]} " == *" $c "* ]] && continue
+    docker stop "$c" >/dev/null && STOPPED+=("$c") && muted "    stopped $c"
+  done
+
+  archive="$RUN/$v.tar.gz"
+  start=$(date +%s)
+  if docker run --rm --network none -v "$v:/volume:ro" "$HELPER" tar -czf - -C /volume . >"$archive" 2>"$RUN/.err"; then
+    size=$(stat -c %s "$archive"); total=$((total + size))
+    printf '  %s✔%s %-32s %s%10s%s  %s%ds%s\n' "$GREEN" "$RESET" "$v" "$BOLD" "$(human_bytes "$size")" "$RESET" "$GREY" $(( $(date +%s) - start )) "$RESET"
+    manifest_vols=$(jq -c --argjson meta "$(docker volume inspect "$v" | jq '.[0] | {name: .Name, driver: .Driver, labels: (.Labels // {}), options: (.Options // {})}')" \
+      --arg file "$v.tar.gz" --argjson size "$size" \
+      --argjson users "$(users_of "$v" | jq -R 'split("\t") | {container: .[1], project: .[2]}' | jq -s .)" \
+      '. + [$meta + {file: $file, size: $size, used_by: $users}]' <<<"$manifest_vols")
+  else
+    err "$v: $(tr '\n' ' ' <"$RUN/.err")"; rm -f "$archive"; failures=$((failures + 1))
+  fi
+  restart_stopped
+done
+rm -f "$RUN/.err"
+
+# ── Compose files of involved projects ──
+mapfile -t projs < <(for v in "${VOLS[@]}"; do users_of "$v" | cut -f3; done | grep -v '^-$' | sort -u)
+for p in "${projs[@]}"; do
+  files=$(jq -r --arg p "$p" '[.[] | .Config.Labels // {} | select(.["com.docker.compose.project"] == $p)
+          | .["com.docker.compose.project.config_files"] // empty][0] // ""' <<<"$containers")
+  [[ -z "$files" ]] && continue
+  mkdir -p "$RUN/compose/$p"
+  IFS=',' read -ra fl <<<"$files"
+  for f in "${fl[@]}"; do
+    if [[ -r "$f" ]]; then
+      cp "$f" "$RUN/compose/$p/"
+      [[ -r "$(dirname "$f")/.env" ]] && cp "$(dirname "$f")/.env" "$RUN/compose/$p/.env" && chmod 600 "$RUN/compose/$p/.env"
+    else muted "    compose file not readable here: $f"; fi
+  done
+  rmdir "$RUN/compose/$p" 2>/dev/null || true
+done
+rmdir "$RUN/compose" 2>/dev/null || true
+
+projects_json=$(jq -c --args '[.[] | .Config.Labels // {} | select(.["com.docker.compose.project"] as $p | $ARGS.positional | index($p))
+  | {name: .["com.docker.compose.project"], working_dir: (.["com.docker.compose.project.working_dir"] // null),
+     config_files: ((.["com.docker.compose.project.config_files"] // "") | split(",") | map(select(. != "")))}] | unique_by(.name)' \
+  "${projs[@]}" <<<"$containers")
+jq -n --arg host "$(hostname)" --arg stamp "$STAMP" --arg helper "$HELPER" --argjson vols "$manifest_vols" --argjson projects "$projects_json" \
+  '{host: $host, created: $stamp, tool: "dm-backup", helper_image: $helper, volumes: $vols, projects: $projects}' >"$RUN/manifest.json"
+(cd "$RUN" && find . -name '*.tar.gz' -printf '%P\n' | sort | xargs -r sha256sum >SHA256SUMS)
+
+# ── Retention ──
+section "Retention"
+if (( KEEP > 0 )); then
+  mapfile -t runs < <(find "$DEST" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended -regex '.*/[0-9]{8}-[0-9]{6}' | sort)
+  excess=$(( ${#runs[@]} - KEEP ))
+  if (( excess > 0 )); then
+    for old in "${runs[@]:0:excess}"; do rm -rf -- "$old"; muted "  removed $(basename "$old")"; done
+  fi
+  kv "Runs kept" "$(( ${#runs[@]} - (excess > 0 ? excess : 0) )) / $KEEP"
+else
+  kv "Runs kept" "all (--keep 0)"
+fi
+
+section "Summary"
+kv "Location" "$RUN"
+kv "Volumes" "$(( ${#VOLS[@]} - failures )) ok$( (( failures )) && echo ", ${RED}${failures} failed${RESET}")"
+kv "Total size" "${BOLD}$(human_bytes "$total")${RESET}"
+echo
+(( failures == 0 )) && ok "Backup complete" || { err "Backup finished with $failures failure(s)"; exit 1; }

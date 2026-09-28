@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# dm-logs — scan container logs for problems, or tail several containers at once.
+set -euo pipefail
+# shellcheck source=../lib/common.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh"
+
+usage() {
+  cat <<EOF
+${BOLD}dm-logs${RESET} — log scanning and multi-container tailing
+
+${BOLD}Usage:${RESET}
+  dm-logs scan [options] [CONTAINER...]   Count errors/warnings per container
+  dm-logs tail [options] [CONTAINER...]   Follow logs of several containers, color-prefixed
+
+${BOLD}Options:${RESET}
+  -s, --since DUR        Time window (default: 24h for scan, 10m for tail) e.g. 30m, 2h, 7d
+  -p, --project NAME     Only containers from this compose project
+  -g, --grep REGEX       (tail) only show lines matching REGEX (case-insensitive)
+  -e, --errors           (tail) only show error/warning lines
+  -n, --samples N        (scan) show the N most recent error lines per container (default: 3)
+  -h, --help             Show this help
+
+With no CONTAINER, all running containers are used.
+EOF
+}
+
+MODE="${1:-}"; [[ "$MODE" == scan || "$MODE" == tail ]] && shift || MODE=scan
+[[ "${MODE}" == "-h" || "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { usage; exit 0; }
+
+SINCE="" PROJECT="" GREP="" ERRORS=0 SAMPLES=3 NAMES=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -s|--since)   SINCE="$2"; shift ;;
+    -p|--project) PROJECT="$2"; shift ;;
+    -g|--grep)    GREP="$2"; shift ;;
+    -e|--errors)  ERRORS=1 ;;
+    -n|--samples) SAMPLES="$2"; shift ;;
+    -h|--help)    usage; exit 0 ;;
+    -*) die "Unknown option: $1 (see --help)" ;;
+    *)  NAMES+=("$1") ;;
+  esac
+  shift
+done
+
+need_docker
+
+# docker logs --since doesn't accept "d"; convert days to hours.
+norm_since() { [[ "$1" =~ ^([0-9]+)d$ ]] && echo "$(( BASH_REMATCH[1] * 24 ))h" || echo "$1"; }
+
+if (( ${#NAMES[@]} == 0 )); then
+  filter=(); [[ -n "$PROJECT" ]] && filter=(--filter "label=com.docker.compose.project=$PROJECT")
+  mapfile -t NAMES < <(docker ps "${filter[@]}" --format '{{.Names}}' | sort)
+fi
+(( ${#NAMES[@]} )) || die "No containers to read logs from"
+
+ERR_RE='(\b(error|err|fatal|panic|critical|crit|exception|traceback|failed|failure|segfault|oom|killed)\b|level=(error|fatal))'
+WARN_RE='(\b(warn|warning|deprecated|timeout|timed out|refused|retry|retrying|unavailable)\b|level=warn)'
+# Portable (mawk-safe, no \b) lowercase variants for streaming.
+AWK_ERR='error|fatal|panic|critical|exception|traceback|failed|failure|segfault|oom|killed'
+AWK_WARN='warn|deprecated|timeout|timed out|refused|retry|unavailable'
+
+# ═════════════════════════════ scan ═════════════════════════════
+if [[ "$MODE" == scan ]]; then
+  SINCE=$(norm_since "${SINCE:-24h}")
+  banner "Log Scan" "last ${SINCE} · ${#NAMES[@]} container(s)"
+  results=(); declare -a samples=()
+  for n in "${NAMES[@]}"; do
+    logs=$(docker logs --since "$SINCE" --timestamps "$n" 2>&1) || { warn "Cannot read logs for $n"; continue; }
+    total=$(grep -c '' <<<"$logs" || true); [[ -z "$logs" ]] && total=0
+    errs=$(grep -Eic "$ERR_RE" <<<"$logs" || true)
+    warns=$(grep -Ei "$WARN_RE" <<<"$logs" | grep -Eivc "$ERR_RE" || true)
+    results+=("$n"$'\t'"$total"$'\t'"$errs"$'\t'"$warns")
+    if (( errs > 0 && SAMPLES > 0 )); then
+      samples[${#results[@]}]=$(grep -Ei "$ERR_RE" <<<"$logs" | tail -n "$SAMPLES")
+    fi
+  done
+
+  section "Summary"
+  {
+    printf 'CONTAINER\tLINES\tERRORS\tWARNINGS\tRATE\n'
+    for r in "${results[@]}"; do
+      IFS=$'\t' read -r n t e w <<<"$r"
+      rate="-"; (( t > 0 )) && rate=$(awk -v e="$e" -v t="$t" 'BEGIN{printf "%.1f", e*100/t}')
+      ec="${GREY}0${RESET}"; (( e > 0 )) && ec="${RED}${BOLD}${e}${RESET}"
+      wc_="${GREY}0${RESET}"; (( w > 0 )) && wc_="${YELLOW}${w}${RESET}"
+      rc="$rate"; [[ "$rate" != "-" ]] && rc=$(color_pct "$rate" 1 5)
+      printf '%s\t%s\t%s\t%s\t%s\n' "${BOLD}${n}${RESET}" "$t" "$ec" "$wc_" "$rc"
+    done
+  } | table
+
+  if (( SAMPLES > 0 )); then
+    for i in "${!results[@]}"; do
+      s="${samples[$((i+1))]:-}"; [[ -z "$s" ]] && continue
+      section "Recent errors — $(cut -f1 <<<"${results[$i]}")"
+      while IFS= read -r line; do
+        ts="${line%% *}"; msg="${line#* }"
+        printf '  %s%s%s %s\n' "$GREY" "${ts:0:19}" "$RESET" "$(trunc "$msg" $(( $(term_width) - 24 )))" |
+          sed -E "s/$ERR_RE/${RED}${BOLD}\1${RESET}/Ig"
+      done <<<"$s"
+    done
+  fi
+  echo
+  exit 0
+fi
+
+# ═════════════════════════════ tail ═════════════════════════════
+SINCE=$(norm_since "${SINCE:-10m}")
+PALETTE=("$CYAN" "$MAGENTA" "$BLUE" "$GREEN" "$BCYAN" "$BMAGENTA" "$BBLUE" "$BGREEN" "$YELLOW")
+w=0; for n in "${NAMES[@]}"; do (( ${#n} > w )) && w=${#n}; done; (( w > 24 )) && w=24
+
+banner "Log Tail" "${#NAMES[@]} container(s) · since ${SINCE}${GREP:+ · grep: $GREP}$( (( ERRORS )) && echo ' · errors only') · Ctrl-C to stop"
+
+# mawk block-buffers piped input unless run interactively.
+AWK_LINEBUF=(); awk -W version 2>&1 | grep -qi mawk && AWK_LINEBUF=(-W interactive)
+
+pids=()
+trap 'kill "${pids[@]}" 2>/dev/null; echo; exit 0' INT TERM
+for i in "${!NAMES[@]}"; do
+  n="${NAMES[$i]}" c="${PALETTE[$(( i % ${#PALETTE[@]} ))]}"
+  prefix=$(printf '%s%-*s%s │ ' "$c$BOLD" "$w" "$(trunc "$n" "$w")" "$RESET")
+  docker logs -f --since "$SINCE" "$n" 2>&1 |
+    awk "${AWK_LINEBUF[@]}" -v P="$prefix" -v R="$RED" -v Y="$YELLOW" -v Z="$RESET" -v G="$(tr 'A-Z' 'a-z' <<<"$GREP")" -v EO="$ERRORS" \
+        -v ER="$AWK_ERR" -v WR="$AWK_WARN" '
+      { l = tolower($0); e = (l ~ ER); w = !e && (l ~ WR)
+        if (EO && !e && !w) next
+        if (G != "" && l !~ G) next
+        print P (e ? R $0 Z : w ? Y $0 Z : $0); fflush() }' &
+  pids+=($!)
+done
+wait

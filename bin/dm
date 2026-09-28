@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# dm — entry point for the docker-maint toolkit:  dm <command> [args]
+set -euo pipefail
+BIN="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+# shellcheck source=../lib/common.sh
+source "$BIN/../lib/common.sh"
+
+# command → one-line description (order = display order)
+COMMANDS=(
+  "status|Admin|Host overview: engine, counts, containers, disk usage, alerts"
+  "images|Admin|Image inventory and registry update check"
+  "cleanup|Admin|Dry-run-first pruning of unused resources"
+  "backup|Backup|Back up volumes chosen by label, project or name (manifest, checksums, retention)"
+  "restore|Backup|Restore volumes from a backup run, restart & health-check their containers"
+  "health|Monitor|Container health report (exit 0/1/2 for cron & alerting)"
+  "monitor|Monitor|Live CPU / memory / IO dashboard"
+  "logs|Monitor|Scan logs for errors, or tail many containers at once"
+  "doc|Document|Generate a Markdown inventory of the host"
+  "compose-extract|Compose|Reverse-engineer compose YAML from running containers"
+  "compose-new|Compose|Scaffold a new stack from a template"
+  "compose-lint|Compose|Validate and audit compose files"
+)
+
+usage() {
+  banner "docker-maint toolkit v${DM_VERSION}" "dm <command> [options]   ·   dm <command> --help"
+  local last=""
+  for c in "${COMMANDS[@]}"; do
+    IFS='|' read -r name group desc <<<"$c"
+    [[ "$group" != "$last" ]] && { section "$group"; last="$group"; }
+    printf '  %s%-17s%s %s\n' "$CYAN$BOLD" "$name" "$RESET" "$desc"
+  done
+  section "Setup"
+  printf '  %s%-17s%s %s\n' "$CYAN$BOLD" "install [DIR]" "$RESET" "Symlink all dm-* tools into DIR (default: /usr/local/bin)"
+  printf '  %s%-17s%s %s\n' "$CYAN$BOLD" "version" "$RESET" "Show version"
+  echo
+  muted "  Colors: auto-disabled when piped · NO_COLOR=1 to disable · FORCE_COLOR=1 to force"
+  echo
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  ""|-h|--help|help) usage ;;
+  version|-V|--version) echo "docker-maint ${DM_VERSION}" ;;
+  install)
+    dest="${1:-/usr/local/bin}"
+    [[ -w "$dest" ]] || die "Cannot write to $dest (try: sudo $0 install $dest)"
+    for f in "$BIN"/dm "$BIN"/dm-*; do
+      ln -sf "$f" "$dest/$(basename "$f")"
+      ok "Linked ${BOLD}$(basename "$f")${RESET} → $f"
+    done
+    ;;
+  *)
+    [[ -x "$BIN/dm-$cmd" ]] || { err "Unknown command: $cmd"; echo; usage; exit 1; }
+    exec "$BIN/dm-$cmd" "$@"
+    ;;
+esac

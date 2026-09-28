@@ -1,18 +1,50 @@
-version: '3.8'
-# Location for Backup script /opt/docker/stacks/backup-script/backup.sh
+# Docker volume backup job — runs dm-backup once and exits (0 = success).
+#
+# Deploy as a Portainer stack (or `docker compose -f docker_full_backup.yml up`) and trigger it
+# from cron, e.g. on the host:
+#   0 2 * * *  docker start -a docker-backup-job
+#
+# Which volumes are backed up is decided by container labels — no hard-coded list:
+#   labels:
+#     - docker-maint.backup=true        # back up this container's named volumes
+#     - docker-maint.backup.stop=true   # stop it while archiving (databases)
+# Override the selection with BACKUP_ARGS, e.g. "-p grafana -p jira" or "--all".
+#
+# Requires the docker-maint repo checked out on the host at DM_REPO (default /opt/docker-maint).
+# dm-compose-lint: disable=docker-sock@backup-job,no-restart@backup-job,no-healthcheck@backup-job
+
+name: docker-backup
+
 services:
   backup-job:
-    image: debian:stable-slim
-    entrypoint: ["/backup-script/backup.sh"]
+    image: docker:29-cli
+    container_name: docker-backup-job
+    restart: "no"                      # one-shot job; cron starts it
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        apk add --no-cache -q bash jq coreutils findutils sed ncurses >/dev/null &&
+        exec /opt/docker-maint/bin/dm-backup --dest /backup --keep "$${BACKUP_KEEP}" \
+             --log "/backup/logs/backup-$$(date +%Y%m%d-%H%M%S).log" $${BACKUP_ARGS}
     environment:
-      - TZ=America/New_York
+      - TZ=${TZ:-America/New_York}
+      - BACKUP_KEEP=${BACKUP_KEEP:-7}
+      - BACKUP_ARGS=${BACKUP_ARGS:---label --stop}
+      - DM_HELPER_IMAGE=${DM_HELPER_IMAGE:-busybox:1.37}
     volumes:
-      - /opt/docker/stacks/backup-script/backup.sh:/backup-script/backup.sh:ro
-      - /var/lib/docker/volumes/portainer_data/_data:/portainer:ro
-      - /var/lib/docker/volumes/jira_postgres_data/_data:/jira_postgres:ro
-      - /var/lib/docker/volumes/grafana_data/_data:/grafana:ro
+      - ${DM_REPO:-/opt/docker-maint}:/opt/docker-maint:ro
+      # dm-backup drives short-lived helper containers through the Docker API
+      - /var/run/docker.sock:/var/run/docker.sock
       - backup_nas:/backup
-    
+      # Same-path mount so compose files referenced by container labels can be saved with each run
+      - ${DM_STACKS:-/opt/stacks}:${DM_STACKS:-/opt/stacks}:ro
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   backup_nas:
     driver: local
